@@ -78,6 +78,35 @@ def contrastive_scores_and_labels(
     return qk, labels
 
 
+def _mrl_scores_labels_and_loss(
+    model: torch.nn.Module,
+    query: dict[str, torch.Tensor],
+    passage: dict[str, torch.Tensor],
+    current_train_n_passages: int,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the Matryoshka weighted local contrastive loss."""
+    if _uses_multi_vector_scoring(model):
+        raise NotImplementedError("MRL is only supported for single-vector bi-encoder pooling.")
+
+    q_full = model(query, normalize=False)
+    p_full = model(passage, normalize=False)
+
+    losses = []
+    scores = labels = None
+    for dim in model.mrl_dims:
+        q_reps = F.normalize(q_full[:, :dim], dim=-1)
+        p_reps = F.normalize(p_full[:, :dim], dim=-1)
+        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, current_train_n_passages)
+        if model.l2_normalize:
+            scores = scores / temperature
+        losses.append(F.cross_entropy(scores, labels))
+
+    weights = model.mrl_weights.to(losses[0].device)
+    loss = (torch.stack(losses) * weights).sum() / weights.sum()
+    return scores, labels, loss
+
+
 def maxsim_scores_and_labels(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -413,71 +442,81 @@ class TrainBiEncoderRecipe(BaseRecipe):
         )
 
         with train_ctx, sync_ctx:
-            q_reps = model(query)
-            p_reps = model(passage)
-
             n_passages = self.train_n_passages
             use_multi_vector_scoring = _uses_multi_vector_scoring(model)
-            if is_train and getattr(model, "do_distributed_inbatch_negative", False):
-                from nemo_automodel.components.models.common.inbatch_neg_utils import (
-                    dist_gather_tensor,
-                    dist_gather_tensor_with_dim1_padding,
-                    mask_gathered_passages_same_doc_as_positive,
+            use_mrl = getattr(model, "mrl_dims", None) is not None
+            if use_mrl:
+                scores, labels, loss = _mrl_scores_labels_and_loss(
+                    model,
+                    query,
+                    passage,
+                    n_passages,
+                    self.temperature,
                 )
-
-                local_bs = q_reps.shape[0]
-                dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
-                rank = torch.distributed.get_rank() if dist_initialized else 0
-                world_size = torch.distributed.get_world_size() if dist_initialized else 1
-                preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
-
-                if use_multi_vector_scoring:
-                    all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
-                    all_p_mask = dist_gather_tensor_with_dim1_padding(passage["attention_mask"], padding_value=False)
-                    expected_p = world_size * local_bs * n_passages
-                    assert all_p.shape[0] == expected_p, (
-                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    )
-                    scores, labels = distributed_maxsim_scores_and_labels(
-                        q_reps,
-                        all_p,
-                        n_passages,
-                        all_p_mask,
-                        rank,
-                    )
-                else:
-                    all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
-                    expected_p = world_size * local_bs * n_passages
-                    assert all_p.shape[0] == expected_p, (
-                        f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
-                    )
-                    scores = torch.mm(q_reps, all_p.t())
-                    labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
-                if model.l2_normalize:
-                    scores = scores / self.temperature
-                passage_doc_ids = batch.get("passage_doc_ids")
-                if passage_doc_ids is not None:
-                    all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
-                    mask_gathered_passages_same_doc_as_positive(
-                        scores,
-                        all_doc_ids,
-                        train_n_passages=n_passages,
-                        rank=rank,
-                        local_batch_size=local_bs,
-                    )
             else:
-                if use_multi_vector_scoring:
-                    scores, labels = maxsim_scores_and_labels(
-                        q_reps,
-                        p_reps,
-                        n_passages,
-                        passage["attention_mask"],
+                q_reps = model(query)
+                p_reps = model(passage)
+
+                if is_train and getattr(model, "do_distributed_inbatch_negative", False):
+                    from nemo_automodel.components.models.common.inbatch_neg_utils import (
+                        dist_gather_tensor,
+                        dist_gather_tensor_with_dim1_padding,
+                        mask_gathered_passages_same_doc_as_positive,
                     )
+
+                    local_bs = q_reps.shape[0]
+                    dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+                    rank = torch.distributed.get_rank() if dist_initialized else 0
+                    world_size = torch.distributed.get_world_size() if dist_initialized else 1
+                    preserve_gather_grad = not getattr(model, "detach_distributed_inbatch_negatives", True)
+
+                    if use_multi_vector_scoring:
+                        all_p = dist_gather_tensor_with_dim1_padding(p_reps, preserve_grad=preserve_gather_grad)
+                        all_p_mask = dist_gather_tensor_with_dim1_padding(
+                            passage["attention_mask"], padding_value=False
+                        )
+                        expected_p = world_size * local_bs * n_passages
+                        assert all_p.shape[0] == expected_p, (
+                            f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                        )
+                        scores, labels = distributed_maxsim_scores_and_labels(
+                            q_reps,
+                            all_p,
+                            n_passages,
+                            all_p_mask,
+                            rank,
+                        )
+                    else:
+                        all_p = dist_gather_tensor(p_reps, preserve_grad=preserve_gather_grad)
+                        expected_p = world_size * local_bs * n_passages
+                        assert all_p.shape[0] == expected_p, (
+                            f"Gathered passage count {all_p.shape[0]} != expected {expected_p}"
+                        )
+                        scores = torch.mm(q_reps, all_p.t())
+                        labels = (torch.arange(local_bs, device=q_reps.device) + rank * local_bs) * n_passages
+                    passage_doc_ids = batch.get("passage_doc_ids")
+                    if passage_doc_ids is not None:
+                        all_doc_ids = dist_gather_tensor(passage_doc_ids.contiguous())
+                        mask_gathered_passages_same_doc_as_positive(
+                            scores,
+                            all_doc_ids,
+                            train_n_passages=n_passages,
+                            rank=rank,
+                            local_batch_size=local_bs,
+                        )
                 else:
-                    scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
+                    if use_multi_vector_scoring:
+                        scores, labels = maxsim_scores_and_labels(
+                            q_reps,
+                            p_reps,
+                            n_passages,
+                            passage["attention_mask"],
+                        )
+                    else:
+                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, n_passages)
                 if model.l2_normalize:
                     scores = scores / self.temperature
-            loss = F.cross_entropy(scores, labels)
+                loss = F.cross_entropy(scores, labels)
 
             loss_buffer.append(loss.clone().detach())
 
@@ -559,21 +598,31 @@ class TrainBiEncoderRecipe(BaseRecipe):
                     query, passage = _unpack_qp(batch)
 
                     model = self.model_parts[0]
-                    q_reps = model(query)
-                    p_reps = model(passage)
-
-                    if _uses_multi_vector_scoring(model):
-                        scores, labels = maxsim_scores_and_labels(
-                            q_reps,
-                            p_reps,
+                    use_mrl = getattr(model, "mrl_dims", None) is not None
+                    if use_mrl:
+                        scores, labels, loss = _mrl_scores_labels_and_loss(
+                            model,
+                            query,
+                            passage,
                             self.val_n_passages,
-                            passage["attention_mask"],
+                            self.temperature,
                         )
                     else:
-                        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
-                    if model.l2_normalize:
-                        scores = scores / self.temperature
-                    loss = F.cross_entropy(scores, labels)
+                        q_reps = model(query)
+                        p_reps = model(passage)
+
+                        if _uses_multi_vector_scoring(model):
+                            scores, labels = maxsim_scores_and_labels(
+                                q_reps,
+                                p_reps,
+                                self.val_n_passages,
+                                passage["attention_mask"],
+                            )
+                        else:
+                            scores, labels = contrastive_scores_and_labels(q_reps, p_reps, self.val_n_passages)
+                        if model.l2_normalize:
+                            scores = scores / self.temperature
+                        loss = F.cross_entropy(scores, labels)
 
                     loss_buffer.append(loss.clone().detach())
                     all_scores.append(scores.detach().cpu())

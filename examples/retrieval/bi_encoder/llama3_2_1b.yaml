@@ -42,6 +42,17 @@ model:
   use_sdpa_patching: true
   torch_dtype: bfloat16
   do_distributed_inbatch_negative: false
+  # Optional Matryoshka Representation Learning (MRL) prefix dimensions.
+  # mrl_dims:
+  #   - 2048
+  #   - 1024
+  #   - 512
+  #   - 256
+  # mrl_weights:
+  #   - 1.0
+  #   - 1.0
+  #   - 1.0
+  #   - 1.0
 
 tokenizer:
   _target_: nemo_automodel.NeMoAutoTokenizer.from_pretrained

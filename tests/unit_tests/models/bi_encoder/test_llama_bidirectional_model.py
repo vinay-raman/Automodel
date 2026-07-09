@@ -270,9 +270,7 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             )
 
     lm = NoTTIDLm(hidden=8)
-    model = BiEncoderModel(
-        model=lm, pooling="avg", l2_normalize=True
-    )
+    model = BiEncoderModel(model=lm, pooling="avg", l2_normalize=True)
     # encode removes token_type_ids and normalizes
     q = {
         "input_ids": torch.ones(2, 3, dtype=torch.long),
@@ -282,6 +280,8 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
     v = model.encode(q)
     assert v.shape == (2, 8)
     assert torch.allclose(torch.linalg.norm(v, dim=-1), torch.ones(2), atol=1e-5)
+    raw_v = model.encode(q, normalize=False)
+    assert torch.allclose(raw_v, torch.ones(2, 8))
     # Compute scores explicitly to avoid coupling to internal repeat implementation
     p = {"input_ids": torch.ones(4, 3, dtype=torch.long), "attention_mask": torch.ones(4, 3, dtype=torch.long)}
     q_reps = model.encode(q)
@@ -314,13 +314,31 @@ def test_encoder_encode_and_compute_scores_and_forward(monkeypatch):
             return OnlyHiddenOutputs(hidden_states)
 
     # Test with model using NoLastLM for query encoder
-    model_no_last = BiEncoderModel(
-        model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True
-    )
+    model_no_last = BiEncoderModel(model=NoLastLM(hidden=8), pooling="avg", l2_normalize=True)
     v2 = model_no_last.encode(
         {"input_ids": torch.ones(2, 3, dtype=torch.long), "attention_mask": torch.ones(2, 3, dtype=torch.long)},
     )
     assert v2.shape == (2, 8)
+
+
+def test_bi_encoder_mrl_config_sorting_and_weights():
+    model = BiEncoderModel(
+        model=FakeLM(hidden=8),
+        pooling="avg",
+        l2_normalize=True,
+        mrl_dims=[8, 2, 4],
+        mrl_weights=[0.8, 0.2, 0.4],
+    )
+
+    assert model.mrl_dims == [2, 4, 8]
+    assert torch.allclose(model.mrl_weights, torch.tensor([0.2, 0.4, 0.8], dtype=torch.float32))
+
+    model_without_weights = BiEncoderModel(model=FakeLM(hidden=8), mrl_dims=[8, 2, 2])
+    assert model_without_weights.mrl_dims == [2, 8]
+    assert torch.allclose(model_without_weights.mrl_weights, torch.ones(2))
+
+    with pytest.raises(AssertionError):
+        BiEncoderModel(model=FakeLM(hidden=8), mrl_dims=[2, 4], mrl_weights=[1.0])
 
 
 def test_encoder_build_and_save(tmp_path, monkeypatch):

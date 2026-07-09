@@ -1144,6 +1144,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
+        mrl_dims: Optional[List[int]] = None,
+        mrl_weights: Optional[List[float]] = None,
         **kwargs,
     ) -> PreTrainedModel:
         """Load a bi-encoder model with infrastructure.
@@ -1159,6 +1161,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
                 negatives during training.
             detach_distributed_inbatch_negatives: Whether to detach remote passage embeddings in distributed
                 in-batch-negative losses. Set to false for full cross-rank gradient flow.
+            mrl_dims: Optional Matryoshka Representation Learning embedding prefix dimensions.
+            mrl_weights: Optional weights for each MRL prefix dimension. Must match ``mrl_dims`` length.
             **kwargs: Forwarded to ``_NeMoAutoModelForRetrievalBase.from_pretrained``.
 
         Returns:
@@ -1170,6 +1174,8 @@ class NeMoAutoModelBiEncoder(_NeMoAutoModelForRetrievalBase):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            mrl_dims=mrl_dims,
+            mrl_weights=mrl_weights,
             **kwargs,
         )
 

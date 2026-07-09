@@ -22,6 +22,7 @@ import nemo_automodel.recipes.retrieval.train_bi_encoder as tbe
 from nemo_automodel._transformers.retrieval import BiEncoderModel, CrossEncoderModel
 from nemo_automodel.recipes.retrieval.train_bi_encoder import (
     TrainBiEncoderRecipe,
+    contrastive_scores_and_labels,
     distributed_maxsim_scores_and_labels,
     maxsim_scores_and_labels,
 )
@@ -48,6 +49,24 @@ class _ToyMultiVectorBiEncoder(torch.nn.Module):
 
     def forward(self, batch):
         return batch["input_ids"].float() * self.scale
+
+
+class _ToyMRLBiEncoder(torch.nn.Module):
+    do_distributed_inbatch_negative = False
+    l2_normalize = True
+    pooling = "avg"
+    mrl_dims = [2, 4]
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+        self.mrl_weights = torch.tensor([1.0, 3.0], dtype=torch.float32)
+
+    def forward(self, batch, normalize=True):
+        embeds = batch["input_ids"].float() * self.scale
+        if normalize and self.l2_normalize:
+            embeds = torch.nn.functional.normalize(embeds, dim=-1)
+        return embeds
 
 
 def _apply_common_mocks(monkeypatch):
@@ -94,6 +113,8 @@ def test_from_pretrained_happy_path(monkeypatch):
         l2_normalize=True,
         do_distributed_inbatch_negative=True,
         detach_distributed_inbatch_negatives=False,
+        mrl_dims=[2, 4],
+        mrl_weights=[0.25, 0.75],
         use_liger_kernel=True,
         use_sdpa_patching=True,
         sdpa_method=None,
@@ -106,6 +127,8 @@ def test_from_pretrained_happy_path(monkeypatch):
     assert last_kwargs["attn_implementation"] == "flash_attention_2"
     assert last_kwargs["do_distributed_inbatch_negative"] is True
     assert last_kwargs["detach_distributed_inbatch_negatives"] is False
+    assert last_kwargs["mrl_dims"] == [2, 4]
+    assert last_kwargs["mrl_weights"] == [0.25, 0.75]
     assert last_kwargs["some_other_kwarg"] == "x"
 
 
@@ -322,6 +345,46 @@ def test_forward_backward_step_supports_local_multi_vector_pooling():
     assert recipe.model_parts[0].scale.grad is not None
 
 
+def test_forward_backward_step_supports_mrl_weighted_prefix_losses():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    recipe.distributed_config = SimpleNamespace(defer_fsdp_grad_sync=True)
+    model = _ToyMRLBiEncoder()
+    recipe.model_parts = [model]
+    recipe.temperature = 0.5
+    recipe.train_n_passages = 2
+
+    batch = {
+        "q_input_ids": torch.tensor([[2.0, 0.0, 0.5, 0.0], [0.0, 3.0, 0.0, 0.5]]),
+        "q_attention_mask": torch.ones(2, 4, dtype=torch.long),
+        "d_input_ids": torch.tensor(
+            [
+                [2.0, 0.0, 0.5, 0.0],
+                [0.0, 2.0, 0.0, 0.5],
+                [0.0, 3.0, 0.0, 0.5],
+                [3.0, 0.0, 0.5, 0.0],
+            ]
+        ),
+        "d_attention_mask": torch.ones(4, 4, dtype=torch.long),
+    }
+    loss_buffer = []
+
+    recipe._forward_backward_step(0, batch, loss_buffer=loss_buffer, num_batches=1, is_train=True)
+
+    expected_losses = []
+    for dim in model.mrl_dims:
+        q_reps = torch.nn.functional.normalize(batch["q_input_ids"][:, :dim], dim=-1)
+        p_reps = torch.nn.functional.normalize(batch["d_input_ids"][:, :dim], dim=-1)
+        scores, labels = contrastive_scores_and_labels(q_reps, p_reps, recipe.train_n_passages)
+        scores = scores / recipe.temperature
+        expected_losses.append(tbe.F.cross_entropy(scores, labels))
+    expected_loss = (torch.stack(expected_losses) * model.mrl_weights).sum() / model.mrl_weights.sum()
+
+    assert len(loss_buffer) == 1
+    assert torch.allclose(loss_buffer[0], expected_loss)
+    assert model.scale.grad is not None
+
+
 def test_validation_epoch_supports_multi_vector_pooling():
     recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
     recipe.dist_env = SimpleNamespace(device="cpu")
@@ -362,6 +425,42 @@ def test_validation_epoch_supports_multi_vector_pooling():
     assert 0.0 <= metrics.metrics["val_acc1"] <= 1.0
     assert 0.0 <= metrics.metrics["val_mrr"] <= 1.0
     assert recipe.model_parts[0].scale.grad is None
+
+
+def test_validation_epoch_supports_mrl():
+    recipe = TrainBiEncoderRecipe.__new__(TrainBiEncoderRecipe)
+    recipe.dist_env = SimpleNamespace(device="cpu")
+    model = _ToyMRLBiEncoder()
+    recipe.model_parts = [model]
+    recipe.temperature = 0.5
+    recipe.val_n_passages = 2
+    recipe.step_scheduler = SimpleNamespace(step=3, epoch=1)
+    recipe.device_mesh = None
+
+    val_dataloader = [
+        {
+            "q_input_ids": torch.tensor([[2.0, 0.0, 0.5, 0.0], [0.0, 3.0, 0.0, 0.5]]),
+            "q_attention_mask": torch.ones(2, 4, dtype=torch.long),
+            "d_input_ids": torch.tensor(
+                [
+                    [2.0, 0.0, 0.5, 0.0],
+                    [0.0, 2.0, 0.0, 0.5],
+                    [0.0, 3.0, 0.0, 0.5],
+                    [3.0, 0.0, 0.5, 0.0],
+                ]
+            ),
+            "d_attention_mask": torch.ones(4, 4, dtype=torch.long),
+        }
+    ]
+
+    metrics = recipe._run_validation_epoch(val_dataloader)
+
+    assert metrics.step == 3
+    assert metrics.epoch == 1
+    assert torch.isfinite(torch.tensor(metrics.metrics["val_loss"]))
+    assert 0.0 <= metrics.metrics["val_acc1"] <= 1.0
+    assert 0.0 <= metrics.metrics["val_mrr"] <= 1.0
+    assert model.scale.grad is None
 
 
 @pytest.mark.parametrize("detach_distributed_inbatch_negatives", [True, False])

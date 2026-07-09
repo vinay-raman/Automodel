@@ -364,6 +364,8 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
+        mrl_dims: list[int] | None = None,
+        mrl_weights: list[float] | None = None,
     ):
         super().__init__()
         _init_encoder_common(self, model)
@@ -371,6 +373,18 @@ class BiEncoderModel(nn.Module):
         self.l2_normalize = l2_normalize
         self.do_distributed_inbatch_negative = do_distributed_inbatch_negative
         self.detach_distributed_inbatch_negatives = detach_distributed_inbatch_negatives
+        if mrl_dims is not None:
+            if mrl_weights is not None:
+                assert len(mrl_weights) == len(mrl_dims)
+                dim_weights = sorted(zip(mrl_dims, mrl_weights))
+                self.mrl_dims = [dim for dim, _ in dim_weights]
+                self.mrl_weights = torch.tensor([weight for _, weight in dim_weights], dtype=torch.float32)
+            else:
+                self.mrl_dims = sorted(set(mrl_dims))
+                self.mrl_weights = torch.ones(len(self.mrl_dims), dtype=torch.float32)
+        else:
+            self.mrl_dims = None
+            self.mrl_weights = None
 
     @classmethod
     def build(
@@ -381,6 +395,8 @@ class BiEncoderModel(nn.Module):
         l2_normalize: bool = True,
         do_distributed_inbatch_negative: bool = False,
         detach_distributed_inbatch_negatives: bool = True,
+        mrl_dims: list[int] | None = None,
+        mrl_weights: list[float] | None = None,
         trust_remote_code: bool = False,
         **hf_kwargs,
     ):
@@ -401,16 +417,19 @@ class BiEncoderModel(nn.Module):
             l2_normalize=l2_normalize,
             do_distributed_inbatch_negative=do_distributed_inbatch_negative,
             detach_distributed_inbatch_negatives=detach_distributed_inbatch_negatives,
+            mrl_dims=mrl_dims,
+            mrl_weights=mrl_weights,
         )
 
     def save_pretrained(self, save_directory: str, **kwargs):
         save_encoder_pretrained(self, save_directory, **kwargs)
 
-    def encode(self, input_dict: dict) -> Optional[torch.Tensor]:
+    def encode(self, input_dict: dict, normalize: bool = True) -> Optional[torch.Tensor]:
         """Encode inputs and return pooled embeddings.
 
         Args:
             input_dict: Tokenized inputs (input_ids, attention_mask, etc.)
+            normalize: Whether to apply the model's L2-normalization setting.
 
         Returns:
             Embeddings [batch_size, hidden_dim], or None if input_dict is empty.
@@ -437,14 +456,14 @@ class BiEncoderModel(nn.Module):
             attention_mask=input_dict["attention_mask"],
             pool_type=self.pooling,
         )
-        if self.l2_normalize:
+        if normalize and self.l2_normalize:
             embeds = F.normalize(embeds, dim=-1)
 
         return embeds.contiguous()
 
-    def forward(self, input_dict: dict = None, **kwargs) -> Optional[torch.Tensor]:
+    def forward(self, input_dict: dict = None, normalize: bool = True, **kwargs) -> Optional[torch.Tensor]:
         """Forward pass -- going through __call__ ensures FSDP2 unshard hooks fire."""
-        return self.encode(input_dict)
+        return self.encode(input_dict, normalize=normalize)
 
 
 class CrossEncoderModel(nn.Module):
