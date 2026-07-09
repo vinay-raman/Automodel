@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
+from transformers import AutoConfig, AutoModel as HFAutoModel
 
 from nemo_automodel import NeMoAutoModelBiEncoder
+from nemo_automodel._transformers.auto_model import _BaseNeMoAutoModelClass
 from nemo_automodel._transformers.retrieval import BiEncoderModel
 from nemo_automodel.components.loss.intermediate_distill import LayerCapture
+from nemo_automodel.shared.utils import dtype_from_str
 
 
 def _get_layers(model: nn.Module) -> nn.ModuleList:
@@ -25,6 +29,50 @@ def _get_layers(model: nn.Module) -> nn.ModuleList:
     ):
         return model.transformer.h
     raise AttributeError("Could not locate transformer layers on model (tried .layers, .model.layers, .transformer.h)")
+
+
+@contextmanager
+def _default_torch_dtype(dtype: torch.dtype | None):
+    if dtype is None:
+        yield
+        return
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def _resolve_init_dtype(torch_dtype, config) -> torch.dtype | None:
+    if torch_dtype == "auto":
+        return dtype_from_str(getattr(config, "torch_dtype", None) or getattr(config, "dtype", None))
+    return dtype_from_str(torch_dtype)
+
+
+class _NeMoAutoModel(_BaseNeMoAutoModelClass, HFAutoModel):
+    """Generic AutoModel variant with Automodel infrastructure support."""
+
+    pass
+
+
+_AUTOMODEL_RUNTIME_KWARGS = {
+    "device_mesh",
+    "moe_mesh",
+    "distributed_config",
+    "peft_config",
+    "tp_plan",
+    "compile_config",
+    "pipeline_config",
+    "qat_config",
+    "moe_config",
+    "activation_checkpointing",
+    "fp8_config",
+    "sdpa_method",
+    "has_packed_sequence",
+    "tp_size",
+    "cp_size",
+}
 
 
 class StudentWithProjection(nn.Module):
@@ -71,6 +119,62 @@ class StudentWithProjection(nn.Module):
             l2_normalize=l2_normalize,
             trust_remote_code=trust_remote_code,
             **kwargs,
+        )
+        return cls(student=student, teacher_hidden_size=teacher_hidden_size, capture_layers=capture_layers)
+
+    @classmethod
+    def build_from_config(
+        cls,
+        pretrained_model_name_or_path: str,
+        teacher_hidden_size: int,
+        pooling: str = "last",
+        l2_normalize: bool = False,
+        capture_layers: Sequence[int] | None = None,
+        trust_remote_code: bool = True,
+        torch_dtype="auto",
+        attn_implementation: str | None = None,
+        random_init_seed: int = 42,
+        **kwargs,
+    ) -> "StudentWithProjection":
+        """Build a student with the checkpoint architecture but freshly initialized weights."""
+        config_kwargs = {
+            key: kwargs.pop(key)
+            for key in ("cache_dir", "revision", "token", "local_files_only")
+            if key in kwargs
+        }
+        runtime_kwargs = {key: kwargs.pop(key) for key in _AUTOMODEL_RUNTIME_KWARGS if key in kwargs}
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+            **config_kwargs,
+        )
+        config.name_or_path = pretrained_model_name_or_path
+        config._name_or_path = pretrained_model_name_or_path
+        if pooling is not None:
+            config.pooling = pooling
+        if attn_implementation is not None:
+            config._attn_implementation = attn_implementation
+        init_dtype = _resolve_init_dtype(torch_dtype, config)
+
+        devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=devices, enabled=True), _default_torch_dtype(init_dtype):
+            torch.manual_seed(int(random_init_seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(random_init_seed))
+            model_kwargs = {
+                "trust_remote_code": trust_remote_code,
+                "torch_dtype": torch_dtype,
+                **runtime_kwargs,
+                **kwargs,
+            }
+            if attn_implementation is not None:
+                model_kwargs["attn_implementation"] = attn_implementation
+            backbone = _NeMoAutoModel.from_config(config, **model_kwargs)
+
+        student = BiEncoderModel(
+            model=backbone,
+            pooling=pooling,
+            l2_normalize=l2_normalize,
         )
         return cls(student=student, teacher_hidden_size=teacher_hidden_size, capture_layers=capture_layers)
 

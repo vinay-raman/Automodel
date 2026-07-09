@@ -330,9 +330,19 @@ _LLAMA_TASKS = {
 _MINISTRAL3_BIDIREC_TASKS = {
     "embedding": "Ministral3BidirectionalModel",
 }
+_MISTRAL_BIDIREC_TASKS = {
+    "embedding": "MistralBidirectionalModel",
+}
+_MINISTRAL_BIDIREC_TASKS = {
+    "embedding": "MinistralBidirectionalModel",
+}
 SUPPORTED_BACKBONES = {
     "llama": _LLAMA_TASKS,
     "llama_bidirec": _LLAMA_TASKS,
+    "mistral": _MISTRAL_BIDIREC_TASKS,
+    "mistral_bidirec": _MISTRAL_BIDIREC_TASKS,
+    "ministral": _MINISTRAL_BIDIREC_TASKS,
+    "ministral_bidirec": _MINISTRAL_BIDIREC_TASKS,
     "ministral3": _MINISTRAL3_BIDIREC_TASKS,
     "ministral3_bidirec": _MINISTRAL3_BIDIREC_TASKS,
 }

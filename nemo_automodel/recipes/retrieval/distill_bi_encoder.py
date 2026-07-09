@@ -54,6 +54,18 @@ def _cfg_get_path(cfg, path: str, default=None):
     return default if cur is None else cur
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 def _move_to_device(batch: dict, device: torch.device) -> dict:
     out = {}
     for key, value in batch.items():
@@ -607,6 +619,9 @@ class EmbeddingDistillRecipe(TrainBiEncoderRecipe):
                 "out_features": int(projection.out_features),
             }
             torch.save(proj_state, epoch_ckpt / "projection.pt")
+
+        if not _as_bool(_cfg_get_path(self.cfg, "checkpoint.save_legacy_student_export", True)):
+            return
 
         legacy_ckpt = ckpt_root / f"step_{step}"
         legacy_ckpt.mkdir(parents=True, exist_ok=True)

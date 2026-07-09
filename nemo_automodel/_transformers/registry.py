@@ -124,6 +124,22 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ),
         ),
         (
+            "MistralBidirectionalModel",
+            (
+                "nemo_automodel.components.models.mistral_bidirectional.model",
+                "MistralBidirectionalModel",
+                {"retrieval"},
+            ),
+        ),
+        (
+            "MinistralBidirectionalModel",
+            (
+                "nemo_automodel.components.models.mistral_bidirectional.model",
+                "MinistralBidirectionalModel",
+                {"retrieval"},
+            ),
+        ),
+        (
             "Mistral4ForCausalLM",
             ("nemo_automodel.components.models.mistral4.model", "Mistral4ForCausalLM"),
         ),
