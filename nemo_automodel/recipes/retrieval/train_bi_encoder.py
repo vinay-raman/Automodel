@@ -322,7 +322,8 @@ class TrainBiEncoderRecipe(BaseRecipe):
         self.pp = None
 
         param_groups = self._build_optimizer_param_groups()
-        self.optimizer = [self.cfg.optimizer.instantiate(params=param_groups)]
+        optimizer = self.cfg.optimizer.build_from_param_groups(param_groups, device_mesh=self.device_mesh)
+        self.optimizer = [optimizer]
         warn_if_torch_adam_with_bf16_params(
             optimizer=self.optimizer,
             is_peft=self.peft_config is not None,
